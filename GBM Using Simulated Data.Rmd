@@ -1,0 +1,169 @@
+---
+title: "Gradient Boosted Models Using Simulated Data"
+output: html_document
+author: "IDEXX People Analytics"    
+
+
+out.width: 400
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("MASS")
+library("plot3D")
+library("ggplot2")
+library("gbm")
+```
+
+![](Gears turning.jpg)  
+
+# This code details how the gbm package works for a bernoulli distributed response.  
+
+* A synthetic rare event dataset is created
+    + N=1010 (10 events; 1,000 non-events); y~i~  $\in$  {0, 1}
+    + The event rate is just below 1%
+    + Three continuous variables are created: N1, N2, N3 each with different distributions depending on event class
+    + For non-events: $$ N1 \sim \mathcal{N}(\mu = 15,\,\sigma^{2} = 1) $$  $$ N2 \sim \mathcal{N}(\mu = 199,\,\sigma^{2} = 10) $$  $$ N2 \sim \mathcal{N}(\mu = 2510,\,\sigma^{2} = 50) $$
+    + For events: $$ N1 \sim \mathcal{N}(\mu = 15,\,\sigma^{2} = 1) $$  $$ N2 \sim \mathcal{N}(\mu = 200,\,\sigma^{2} = 10) $$  $$ N2 \sim \mathcal{N}(\mu = 2500,\,\sigma^{2} = 50) $$
+
+
+```{r echo=TRUE}
+#Set random generator seed
+set.seed(456)
+
+#Simulate non-event data from multi-variate normal distribution 
+Sim.Norm.K1 <- mvrnorm(n = 1000, 
+                       mu=c(15, 199, 2510), 
+                       Sigma = matrix(c(1, 0, 0, 0, 10, 0, 0, 0, 50), nrow = 3, ncol = 3), 
+                       tol = 1e-6, 
+                       empirical = FALSE)
+Sim.Norm.K1.class <- cbind.data.frame(0, Sim.Norm.K1)
+colnames(Sim.Norm.K1.class) <- c("Class","N1","N2","N3")
+
+#Simulate event data from multi-variate normal distribution
+Sim.Norm.K2 <- mvrnorm(n = 10, 
+                       mu=c(15, 200, 2500), 
+                       Sigma = matrix(c(1, 0, 0, 0, 10, 0, 0, 0, 50), nrow = 3, ncol = 3), 
+                       tol = 1e-6, 
+                       empirical = FALSE)
+Sim.Norm.K2.class <- cbind.data.frame(1, Sim.Norm.K2)
+colnames(Sim.Norm.K2.class) <- c("Class","N1","N2","N3")
+
+#Smoosh it all together in one data frame
+Rare.Data.Frame <- rbind.data.frame(Sim.Norm.K1.class, Sim.Norm.K2.class)
+```
+
+# Three dimensional plot of feature space
+
+Data points for rare events are in red.
+
+```{r echo=FALSE}
+#3D plot my data frame
+with(Rare.Data.Frame, scatter3D(x = N3, y = N2, z = N1, colvar = Class,
+                                pch = 16, cex = 1.5, xlab = "N1", ylab = "N2",
+                                zlab = "N3",
+                                main = "Synthetic Data", ticktype = "detailed",
+                                col =  jet2.col(2), alpha=0.5))
+```
+ 
+ 
+ 
+# Density plot for each variable 
+
+Events in blue; non-events in grey.
+
+```{r echo=FALSE}                               
+ggplot(data=Rare.Data.Frame,aes(x=N1,group=Class,fill=Class)) + geom_density(alpha=0.2) + labs(title="Compare Distibution of N1")
+ggplot(data=Rare.Data.Frame,aes(x=N2,group=Class,fill=Class)) + geom_density(alpha=0.2) + labs(title="Compare Distibution of N2")
+ggplot(data=Rare.Data.Frame,aes(x=N3,group=Class,fill=Class)) + geom_density(alpha=0.2) + labs(title="Compare Distibution of N3") 
+```
+
+The densities for variables N1 and N2 are substantially overlapping for the two classes. The distribution of N3 for events versus non-events does have some overlap, but there is a clear difference in the distribution for the two classes. This variable should be the most predictive.  
+
+
+# GBM - code used to fit model
+
+```{r echo=TRUE}
+#Set random generator seed
+set.seed(123)
+Bern.gbm <-     gbm(Class ~  ., #Predict class using all other variables in the data frame
+                    data=Rare.Data.Frame,
+                    distribution = "bernoulli",
+                    var.monotone = NULL,
+                    n.trees = 100, #per Friedman et al: setting shrinkage low & iterations high
+                    interaction.depth = 2, #Number of splits (2) is usually insufficient and > 10 rarely needed)
+                    n.minobsinnode = 1, #Minimum number of observations per node...this should be higher in practice
+                    shrinkage = 0.005, #per Friedman et al: setting shrinkage low & iterations high
+                    bag.fraction = 1, #1 means NO subsampling (for regression 0.5<=bag.fraction<=0.8 and for classification > 0.8 or 1)
+                    cv.folds=, #in practice 3 to 5 for selection optimal number of trees to grow
+                    keep.data = TRUE,
+                    verbose = FALSE,
+                    class.stratify.cv=, 
+                    n.cores = 4) #quad core processing
+
+```
+
+
+
+# Variable importance weights and names of elements stored in Bern.gbm object
+
+```{r echo=FALSE}                               
+summary(Bern.gbm)
+names(Bern.gbm)
+```
+
+
+
+# GBM algorithm pseudo code
+
+* 1. Initialize $\hat f(x)$ to be a constant: $\ln$ $\frac{\Sigma y}{\Sigma (1 - y)}$ = $\ln$ $\frac{10}{1000}$ = -4.60517  
+* 2. Randomly select bag.fraction * N cases from dataset (we set bag.fraction to 1, so we will select all N = 1010 cases)  
+* 3. Fit a regression tree to the values of the gradient (these are continuous values, so the decision tree will be a regression tree not a classification tree). For the bernoulli distribution, the gradient is:  
+    $$ z_i = y_i - \frac{1}{1 + exp(-f(x_i))} $$  
+    + For events the initial gradient is: $$ z_i = 1 - \frac{1}{1 + exp(4.60517)} = 0.99009901 $$  
+    + For non-events the initial gradient is: $$ z_i = 0 - \frac{1}{1 + exp(4.60517)} = -0.00990099$$  
+* 4. Calculate predictions for terminal nodes of regression tree:  
+    + Terminal node estimates:  $\rho_k = \frac{ \Sigma (y_i - p_i)}{\Sigma p_i(1 - p_i)}$  
+    + Where $p_i = \frac{1}{1 - exp(-f(x_i))}$   
+* 5. Update $\hat f(x)$:  
+    + $\hat f(x) \leftarrow \hat f(x) + \lambda * \rho_k(x)$    
+* 6. Lather, rinse, repeat from step 2 substituting the new $\hat f(x)$ values in the equations above. Do this n.trees number of times.   
+ 
+ 
+# Note that initialized $\hat f(x)$ is stored in Bern.gbm
+```{r echo=TRUE}                               
+Bern.gbm$initF
+```
+
+
+# Details for first tree fit
+
+```{r echo=TRUE}
+options(width = 300)
+print(pretty.gbm.tree(Bern.gbm,1))
+```
+
+* SplitVar: "-1" indicates the terminal node. Other numbers ("2") indicate the index of the splitting variable (the index starts at 0, not 1, so "2" means the 3rd variable in my dataset).
+* SplitCodePred: The cutoff value for the SplitVar (for the first split, when N3 > 2501.872 then go to the right node, otherwise go to the left node), except for terminal nodes.
+* LeftNode, RightNode, MissingNode contain the index of the row in the table with information for that node.
+* Weight: the number of observations in that node.
+* ErrorReduction (this is complicated)...
+    + Mean $z_i$ overall (before splits): 0
+    + Mean $z_i$ in Node 1: 0.063867
+    + Mean $z_i$ in Node 5: -0.00877
+    + Sum of Squared Error for NULL model (no splits): $$ \sum_{i = 1}^{N} (z_i - \bar{z})^{2} = \sum_{i = 1}^{N} (z_i - 0)^{2} = 9.90099 $$
+    + Sum of Squared Error for Node 1: $$ \sum (z_i - 0.063867)^{2}  $$ 
+    + Sum of Squared Error for Node 5: $$ \sum (z_i + 0.00877)^{2} $$ 
+    + Add the Sum of Squared Error for Node 1 and Node 5: 9.334939
+    + First split error reduction: 9.0099 - 9.334939 = 0.5660507 = ErrorReduction after first split
+* Prediction: $\lambda$ (a.k.a. shrinkage) * $\rho_k$
+    + For example, Node 2 (see formula for terminal node estimates in pseudo code): $$\rho_2 = \frac{\sum_{i = 1} (y_i - 0.00990099)}{0.00990099(1 - 0.00990099)} = \frac{6.80198}{1.18615} = 5.734463$$
+    $$ \hat f_2(x) \leftarrow \hat f_2(x) + \lambda * \rho_2(x) $$
+    $$ \hat f_2(x) \leftarrow -4.60517 + 0.005 * 5.734463$$
+    $$ \hat f_2(x) \leftarrow -4.60517 + 0.02867231 = -4.5765$$
+    + Note that above, 0.005 is the shrinkage parameter and 0.02867231 is the Prediction for node 2 from the table above
+    + This amount can be converted to $\hat \pi$ $$ -4.5765 = ln(\frac{\hat \pi}{1 - \hat \pi}) $$ $$\hat \pi = 0.01019$$
+    + Compare 0.01019 to 10/1010 = 0.00990099; members of node 2 have a higher than average predicted probability of the event occuring after the first iteration of the algorithm 
+
+        
+Documentation by [Katie Goznikar](https://www.linkedin.com/in/katherine-m-goznikar-7b58b841/)
